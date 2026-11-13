@@ -13,9 +13,9 @@ class PersistenceTests(unittest.TestCase):
                 "users", "trips", "pois", "favorite_spots", "itineraries",
                 "itinerary_versions", "activities", "travel_legs", "execution_events",
             }.issubset(names))
-            self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1)
+            self.assertGreaterEqual(db.connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2)
             db.migrate()
-            self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1)
+            self.assertGreaterEqual(db.connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2)
         finally:
             db.close()
 

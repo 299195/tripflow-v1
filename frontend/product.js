@@ -41,3 +41,99 @@
   $("chatDate").value=new Date().toLocaleDateString("en-CA",{timeZone:"Asia/Shanghai"});
   api("/health").then(()=>$("serviceStatus").textContent="准备好出发").catch(()=>$("serviceStatus").textContent="暂时无法连接");loadMine();
 })();
+
+/* TripFlow V2 itinerary workspace. This layer keeps the V1 journey flows intact
+   while adding V2-compatible planning, event and version interactions. */
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const v2 = { user: localStorage.getItem("tripflow-user") || "local-traveler", trip: null, itinerary: null, data: null, candidates: [], selected: null, versions: [] };
+  const el = (tag, cls, text) => { const node = document.createElement(tag); if (cls) node.className = cls; if (text !== undefined) node.textContent = String(text); return node; };
+  const safe = value => value === undefined || value === null || value === "" ? "暂无信息" : String(value);
+  const errorText = detail => typeof detail === "string" ? detail : (detail?.detail || detail?.message || detail?.error_message || "请求未完成，请稍后重试");
+  const labels = { planned: "待出发", confirmed: "已确认", in_progress: "进行中", completed: "已完成", skipped: "已跳过", cancelled: "已取消" };
+  let toastTimer;
+  const toast = (message, error = false) => { const box = $("toast"); if (!box) return; box.textContent = message; box.className = error ? "error" : ""; box.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => { box.hidden = true; }, 5000); };
+  async function api(url, options = {}) {
+    const headers = { ...(options.body ? { "Content-Type": "application/json" } : {}), ...(options.headers || {}) };
+    const response = await fetch(url, { ...options, headers });
+    let body; try { body = await response.json(); } catch (_) { body = { detail: "服务暂时没有响应" }; }
+    if (!response.ok) { const error = Error(errorText(body?.detail || body)); error.status = response.status; throw error; }
+    return body;
+  }
+  async function compat(urls, options = {}) {
+    let last;
+    for (const url of urls) { try { return await api(url, options); } catch (error) { last = error; if (![404, 405, 501].includes(error.status)) throw error; } }
+    throw last || Error("接口暂不可用");
+  }
+  async function busy(button, task) { if (!button) return task(); button.disabled = true; const label = button.textContent; button.textContent = "请稍候…"; try { return await task(); } finally { button.disabled = false; button.textContent = label; } }
+  const activities = data => data?.activities || data?.items || [];
+  const routes = data => data?.travel_legs || data?.route_segments || data?.routes || data?.legs || [];
+  const idOf = activity => activity.id || activity.activity_id || String(activity.sequence || "");
+  const timeOf = value => value ? String(value).replace("T", " ").slice(11, 16) : "--:--";
+  const sourceOf = route => String(route?.source || route?.provider || route?.route_source || route?.status || "estimate").toLowerCase();
+  const sourceLabel = route => { const source = sourceOf(route); if (["amap", "gaode", "real"].some(item => source.includes(item))) return "高德路线"; if (source.includes("cache")) return "缓存路线"; if (source.includes("failed") || source.includes("unavailable")) return "路线不可用"; return "估算路线"; };
+  const sourceClass = route => { const source = sourceOf(route); if (source.includes("failed") || source.includes("unavailable")) return "route-failed"; return ["amap", "gaode", "real"].some(item => source.includes(item)) ? "route-real" : ""; };
+  const routeFor = (list, from, to, index) => list.find(route => String(route.from_activity_id || route.from_id || "") === String(idOf(from)) || String(route.to_activity_id || route.to_id || "") === String(idOf(to))) || list[index - 1] || null;
+  const duration = route => route?.duration_minutes != null ? `${route.duration_minutes} 分钟` : route?.duration_seconds != null ? `${Math.round(route.duration_seconds / 60)} 分钟` : "时长未知";
+  const distance = route => route?.distance_meters != null ? `${(Number(route.distance_meters) / 1000).toFixed(1)} 公里` : route?.distance != null ? `${route.distance} 米` : "距离未知";
+
+  function setState(id, text, kind = "") { const node = $(id); if (!node) return; node.textContent = text; node.className = `inline-state ${kind}`.trim(); node.hidden = !text; }
+  function renderMeta(data) {
+    const box = $("tripMeta"); box.replaceChildren();
+    [["日期", data.date || data.start_date || v2.trip?.start_date], ["状态", labels[data.status] || data.status || "已保存"], ["当前版本", data.version_number ? `V${data.version_number}` : "当前版本"]].forEach(([label, value]) => { const item = el("span", "meta-item"); item.append(el("strong", null, `${label}：`), el("span", null, safe(value))); box.append(item); });
+  }
+  function renderTimeline(data) {
+    const list = $("activities"); list.replaceChildren(); const items = activities(data); const routeList = routes(data); const selector = $("eventActivity"); selector.replaceChildren(el("option", null, "请选择地点"));
+    if (!items.length) { list.append(el("div", "empty timeline-empty", "这趟旅行还没有可展示的活动。")); $("timelineHint").textContent = "暂无时间轴"; return; }
+    $("timelineHint").textContent = `${items.length} 个地点 · 路线来源会显示在地点之间`;
+    items.forEach((activity, index) => {
+      const id = idOf(activity); const option = el("option", null, activity.title || activity.name || `第 ${index + 1} 站`); option.value = id; selector.append(option);
+      if (index > 0) { const route = routeFor(routeList, items[index - 1], activity, index); const row = el("div", "route-row"); row.append(el("span", null, "↓"), el("span", `route-source ${sourceClass(route)}`, sourceLabel(route)), el("span", null, `${distance(route)} · ${duration(route)}`)); list.append(row); }
+      const item = el("div", `timeline-item${activity.status === "skipped" ? " is-skipped" : ""}`); item.dataset.activityId = id;
+      const time = el("div", "timeline-time", `${timeOf(activity.starts_at)}\n${timeOf(activity.ends_at)}`); const line = el("div", "timeline-line"); line.append(el("span", "timeline-dot"));
+      const card = el("div", `timeline-card${activity.status === "in_progress" ? " is-current" : ""}`); const title = el("div", "timeline-title"); title.append(el("strong", null, activity.title || activity.name || `第 ${index + 1} 站`), el("span", "activity-status", labels[activity.status] || activity.status || "待出发")); card.append(title, el("p", null, [activity.address, activity.note].filter(Boolean).join(" · ") || "地点详情待补充")); if (activity.reservation_required) card.append(el("p", null, `预约提醒${activity.reservation_ref ? `：${activity.reservation_ref}` : "：请提前确认"}`)); item.append(time, line, card); list.append(item);
+    });
+  }
+  function unwrap(data) { return data?.data && !Array.isArray(data.data) ? data.data : data; }
+  async function loadItinerary() { const data = unwrap(await api(`/api/v1/itineraries/${encodeURIComponent(v2.itinerary)}`)); v2.data = data; renderMeta(data); renderTimeline(data); return data; }
+  async function loadMineV2() {
+    try {
+      const data = await api(`/api/v1/users/${encodeURIComponent(v2.user)}/profile`); const list = $("trips"); if (!list) return; list.replaceChildren();
+      if (!data.trips?.length) { list.append(el("div", "empty", "还没有保存的行程，试试首页的旅行助手。")); return; }
+      data.trips.forEach(trip => { const row = el("div", "list-item"); const text = el("div"); text.append(el("strong", null, trip.title || `${trip.city}旅行`), el("small", null, `${safe(trip.city)} · ${safe(trip.start_date)}`)); const open = el("button", "link", "查看 →"); open.type = "button"; open.onclick = () => openTrip(trip); row.append(text, open); list.append(row); });
+    } catch (error) { toast(`暂时无法加载我的旅行：${error.message}`, true); }
+  }
+  async function openTrip(trip) {
+    v2.trip = trip; v2.itinerary = trip.itinerary_id || trip.current_itinerary_id || trip.itinerary?.id; if (!v2.itinerary) { toast("这趟行程还没有可查看的版本", true); return; }
+    $("tripDetail").hidden = false; setState("detailState", "正在加载行程路线…", "loading"); try { await loadItinerary(); setState("detailState", ""); $("tripDetail").scrollIntoView({ behavior: "smooth" }); } catch (error) { setState("detailState", `行程加载失败：${error.message}`, "error"); toast(error.message, true); }
+  }
+
+  function candidatesOf(data) { const raw = data?.candidates || data?.options || data?.candidate_plans || data?.plans || data?.data?.candidates || data?.data || []; return Array.isArray(raw) ? raw : []; }
+  const candidateTitle = (candidate, index) => candidate.title || candidate.name || candidate.label || `方案 ${index + 1}`;
+  const candidateItems = candidate => candidate.activities || candidate.itinerary?.activities || candidate.snapshot?.activities || [];
+  function renderCandidates(response, eventPayload) {
+    const candidates = candidatesOf(response).slice(0, 3); v2.candidates = candidates; v2.proposal = response; v2.selected = null; const box = $("replanCandidates"); box.replaceChildren(); $("replanPanel").hidden = false; $("confirmReplan").disabled = true; $("replanSummary").textContent = candidates.length ? `收到 ${candidates.length} 个候选方案，请选择一个查看变化。` : "当前没有可执行的替代方案。";
+    if (!candidates.length) { box.append(el("div", "empty", "当前约束下没有可执行方案，请调整时间或手动选择地点。")); return; }
+    candidates.forEach((candidate, index) => { const card = el("article", "candidate-card"); const header = el("header"); const radio = document.createElement("input"); radio.type = "radio"; radio.name = "replan-candidate"; radio.value = String(index); header.append(radio, el("strong", null, candidateTitle(candidate, index))); card.append(header, el("p", null, candidate.explanation || candidate.reason || candidate.summary || "方案将根据当前事件重新安排后续活动。")); const metrics = el("div", "candidate-metrics"); metrics.append(el("span", null, `到达 ${safe(candidate.finish_time || candidate.end_time || "时间待计算")}`), el("span", null, `路程 ${safe(candidate.total_distance_meters || candidate.distance_meters || "待计算")}`), el("span", null, `活动 ${candidateItems(candidate).length || candidate.activity_count || "待计算"} 个`)); card.append(metrics); const changes = candidate.changes || candidate.change_summary || candidate.affected_activities; if (changes) card.append(el("div", "candidate-change", typeof changes === "string" ? changes : `调整内容：${JSON.stringify(changes)}`)); const select = () => { v2.selected = candidate; box.querySelectorAll(".candidate-card").forEach(node => node.classList.remove("selected")); card.classList.add("selected"); radio.checked = true; $("confirmReplan").disabled = false; $("replanSummary").textContent = `已选择“${candidateTitle(candidate, index)}”，确认后生成新版本。`; }; radio.onchange = select; card.onclick = click => { if (click.target !== radio) select(); }; box.append(card); });
+    v2.eventPayload = eventPayload;
+  }
+  async function eventApi(payload) { return compat([`/api/v2/itineraries/${v2.itinerary}/events`, `/api/v2/itineraries/${v2.itinerary}/execution-events`, `/api/v1/itineraries/${v2.itinerary}/execution-events`], { method: "POST", body: JSON.stringify(payload) }); }
+  async function previewApi(payload) { return compat([`/api/v2/itineraries/${v2.itinerary}/replan/preview`, `/api/v2/itineraries/${v2.itinerary}/replan`, `/api/v1/itineraries/${v2.itinerary}/replan/preview`], { method: "POST", body: JSON.stringify(payload) }); }
+  async function trigger(type, button) {
+    if (!v2.itinerary) { toast("请先打开一趟行程", true); return; } const activityId = $("eventActivity").value; if (!activityId) { setState("eventState", "请先选择受到影响的地点", "error"); return; }
+    const delay = type === "delay" ? Number($("delayMinutes").value) : 0; const eventType = type === "delay" ? "delayed" : type === "location_unavailable" ? "closed" : "skipped"; const payload = { event_type: eventType, activity_id: activityId, delay_minutes: delay, note: type === "delay" ? `用户报告延误 ${delay} 分钟` : type === "location_unavailable" ? "用户报告地点暂时不可用" : "用户选择跳过该地点", occurred_at: new Date().toISOString(), base_version_id: v2.data?.current_version_id, idempotency_key: `event-${v2.itinerary}-${activityId}-${eventType}-${Date.now()}` };
+    setState("eventState", "正在记录变化并计算可选方案…", "loading"); try { const eventResponse = await busy(button, () => eventApi(payload)); const response = eventResponse?.replan_preview || eventResponse?.candidates ? (eventResponse?.replan_preview || eventResponse) : await previewApi(payload); renderCandidates(response, payload); setState("eventState", "已生成候选方案，请比较后决定是否更新行程。", ""); } catch (error) { setState("eventState", `暂时无法生成调整方案：${error.message}`, "error"); toast(error.message, true); }
+  }
+  $("delayEvent").onclick = event => trigger("delay", event.currentTarget); $("closedEvent").onclick = event => trigger("location_unavailable", event.currentTarget); $("skipEvent").onclick = event => trigger("skipped", event.currentTarget); $("cancelReplan").onclick = () => { $("replanPanel").hidden = true; v2.selected = null; };
+  $("confirmReplan").onclick = async () => { if (!v2.selected || !v2.proposal?.proposal_id) return; setState("eventState", "正在保存新版本…", "loading"); const payload = { proposal_id: v2.proposal.proposal_id, option_id: v2.selected.option_id || v2.selected.id || v2.selected.candidate_id, base_version_id: v2.proposal.base_version_id || v2.data?.current_version_id, idempotency_key: `tripflow-${v2.itinerary}-${v2.proposal.proposal_id}`, change_reason: v2.selected.reason || "确认重规划方案" }; try { await busy($("confirmReplan"), () => compat([`/api/v2/itineraries/${v2.itinerary}/replan/confirm`, `/api/v1/itineraries/${v2.itinerary}/replan/confirm`], { method: "POST", body: JSON.stringify(payload) })); $("replanPanel").hidden = true; await loadItinerary(); setState("eventState", "新版本已保存，时间轴已经更新。", ""); toast("调整已保存为新版本"); } catch (error) { setState("eventState", `保存新版本失败：${error.message}`, "error"); toast(error.message, true); } };
+
+  const snapshot = version => { if (version?.snapshot && typeof version.snapshot === "object") return version.snapshot; if (version?.snapshot_json) { try { return typeof version.snapshot_json === "string" ? JSON.parse(version.snapshot_json) : version.snapshot_json; } catch (_) { return {}; } } return version || {}; };
+  function diff(version) { const before = activities(snapshot(version)); const after = activities(v2.data); const oldIds = new Set(before.map(idOf)); const newIds = new Set(after.map(idOf)); const added = after.filter(item => !oldIds.has(idOf(item))).map(item => item.title || item.name); const removed = before.filter(item => !newIds.has(idOf(item))).map(item => item.title || item.name); const moved = before.filter(item => { const now = after.find(candidate => idOf(candidate) === idOf(item)); return now && (now.starts_at !== item.starts_at || now.ends_at !== item.ends_at); }).map(item => item.title || item.name); const parts = []; if (added.length) parts.push(`新增：${added.join("、")}`); if (removed.length) parts.push(`移除：${removed.join("、")}`); if (moved.length) parts.push(`时间变化：${moved.join("、")}`); return parts.join("；") || "未发现可展示的活动差异，详情以该版本快照为准。"; }
+  function renderVersions(list) { v2.versions = list; const box = $("versions"); box.replaceChildren(); box.hidden = false; if (!list.length) { box.append(el("div", "empty", "暂时没有历史版本。")); return; } list.forEach(version => { const row = el("div", "version-row"); row.append(el("span", "version-badge", `V${version.version_number ?? "?"}`), el("p", null, version.change_reason || version.reason || "行程更新")); const actions = el("div", "version-actions"); const showDiff = el("button", "secondary", "看差异"); showDiff.type = "button"; showDiff.onclick = () => { const current = row.querySelector(".diff-box"); if (current) current.remove(); else row.append(el("div", "diff-box", diff(version))); }; const restore = el("button", "secondary", "恢复"); restore.type = "button"; restore.onclick = () => restoreVersion(version); actions.append(showDiff, restore); row.append(actions); box.append(row); }); }
+  $("versionsButton").onclick = async () => { if (!v2.itinerary) return; try { const response = await compat([`/api/v2/itineraries/${v2.itinerary}/versions`, `/api/v1/itineraries/${v2.itinerary}/versions`]); renderVersions(response.data || response.versions || []); } catch (error) { toast(`历史版本加载失败：${error.message}`, true); } };
+  async function restoreVersion(version) { if (!window.confirm(`确定恢复到 V${version.version_number} 吗？恢复操作会生成一个新的当前版本。`)) return; try { await compat([`/api/v2/itineraries/${v2.itinerary}/restore`, `/api/v1/itineraries/${v2.itinerary}/restore`], { method: "POST", body: JSON.stringify({ version_id: version.id, restored_from_version_id: version.id }) }); await loadItinerary(); toast(`已恢复到 V${version.version_number}，并生成新的当前版本`); } catch (error) { toast(`恢复失败：${error.message}`, true); } }
+  $("closeDetail").onclick = () => { $("tripDetail").hidden = true; }; $("refreshMine").onclick = loadMineV2;
+  document.querySelectorAll('[data-page="mine"]').forEach(node => node.addEventListener("click", () => setTimeout(loadMineV2, 100)));
+  loadMineV2();
+})();

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,9 @@ from .domain.entities import new_id
 from .planner import DeterministicPlanner, PlanInput
 from .persistence.database import SqliteDatabase
 from .qwen_agent import QwenAgent
+from .agent_runtime import TripFlowAgentCoordinator
+from .replanner import Replanner
+from .route_service import AmapRouteProvider, CachedRouteProvider
 
 
 class TripFlowService:
@@ -19,6 +23,20 @@ class TripFlowService:
         self.db.migrate()
         self.planner = planner or DeterministicPlanner()
         self.agent = agent or QwenAgent()
+        self.replanner = Replanner()
+        self.coordinator = TripFlowAgentCoordinator(self.db)
+        self.route_provider = None
+        if os.getenv("AMAP_API_KEY"):
+            from tripflow_amap import AmapAdapter, AmapSettings
+            self.route_provider = CachedRouteProvider(
+                AmapRouteProvider(
+                    AmapAdapter(AmapSettings.from_env()),
+                    mode=os.getenv("TRIPFLOW_ROUTE_MODE", "walking"),
+                    allow_estimate=os.getenv("TRIPFLOW_ROUTE_ALLOW_ESTIMATE", "1").lower() not in {"0", "false", "no"},
+                ),
+                self.db,
+                ttl_minutes=int(os.getenv("TRIPFLOW_ROUTE_CACHE_MINUTES", "30")),
+            )
 
     def close(self) -> None:
         self.db.close()
@@ -81,7 +99,7 @@ class TripFlowService:
             raise KeyError("trip not found")
         poi_ids = data["poi_ids"]
         pois = {str(r["id"]): self._poi_row(r) for r in self.db.connection.execute(f"SELECT * FROM pois WHERE id IN ({','.join('?' for _ in poi_ids)})", poi_ids)}
-        result = self.planner.plan(PlanInput(city=trip["city"], date=data.get("date", trip["start_date"]), poi_ids=poi_ids, pois=pois, start=data.get("start", "09:00"), end=data.get("end", "18:00"), stay_minutes=data.get("stay_minutes"), fixed_booking=data.get("fixed_booking"), route_overrides=data.get("route_overrides")))
+        result = self.planner.plan(PlanInput(city=trip["city"], date=data.get("date", trip["start_date"]), poi_ids=poi_ids, pois=pois, start=data.get("start", "09:00"), end=data.get("end", "18:00"), stay_minutes=data.get("stay_minutes"), fixed_booking=data.get("fixed_booking"), route_overrides=data.get("route_overrides")), route_provider=self.route_provider)
         itinerary = self.db.connection.execute("SELECT * FROM itineraries WHERE trip_id = ?", (trip_id,)).fetchone()
         self.db.connection.execute("DELETE FROM travel_legs WHERE itinerary_id = ?", (itinerary["id"],))
         self.db.connection.execute("DELETE FROM activities WHERE itinerary_id = ?", (itinerary["id"],))
@@ -90,7 +108,7 @@ class TripFlowService:
             aid = new_id(); activity_ids.append(aid)
             self.db.connection.execute("INSERT INTO activities(id,itinerary_id,poi_id,sequence,title,starts_at,ends_at,status,reservation_required,reservation_ref,note) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (aid, itinerary["id"], a.poi_id, a.sequence, a.title, a.starts_at, a.ends_at, "planned", int(a.reservation_required), a.reservation_ref, None))
         for leg, from_id, to_id in zip(result.legs, activity_ids, activity_ids[1:]):
-            self.db.connection.execute("INSERT INTO travel_legs(id,itinerary_id,from_activity_id,to_activity_id,mode,duration_minutes,distance_meters,route_data_json) VALUES(?,?,?,?,?,?,?,?)", (new_id(), itinerary["id"], from_id, to_id, "walking", leg.duration_minutes, leg.distance_meters, json.dumps({"source": leg.source})))
+            self.db.connection.execute("INSERT INTO travel_legs(id,itinerary_id,from_activity_id,to_activity_id,mode,duration_minutes,distance_meters,route_data_json) VALUES(?,?,?,?,?,?,?,?)", (new_id(), itinerary["id"], from_id, to_id, "walking", leg.duration_minutes, leg.distance_meters, json.dumps({"source": leg.source, "fetched_at": self._now()}, ensure_ascii=False)))
         self.db.connection.execute("UPDATE trips SET status='ready' WHERE id = ?", (trip_id,))
         snapshot = self._snapshot(itinerary["id"], trip_id)
         version = new_id()
@@ -138,12 +156,79 @@ class TripFlowService:
     def execution_event(self, itinerary_id: str, data: dict[str, Any]) -> dict[str, Any]:
         event_id = new_id(); self.db.connection.execute("INSERT INTO execution_events(id,itinerary_id,activity_id,event_type,occurred_at,note) VALUES(?,?,?,?,?,?)", (event_id, itinerary_id, data.get("activity_id"), data["event_type"], data.get("occurred_at", self._now()), data.get("note"))); self.db.connection.commit(); return {"id": event_id, **data}
 
-    def get_itinerary(self, itinerary_id: str) -> dict[str, Any]:
-        row = self._itinerary(itinerary_id); return {"id": itinerary_id, "trip_id": row["trip_id"], "status": row["status"], "activities": [dict(x) for x in self.db.connection.execute("SELECT * FROM activities WHERE itinerary_id=? ORDER BY sequence", (itinerary_id,))], "travel_legs": [dict(x) for x in self.db.connection.execute("SELECT * FROM travel_legs WHERE itinerary_id=?", (itinerary_id,))]}
+    def preview_replan(self, itinerary_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        itinerary = self._itinerary(itinerary_id)
+        base = itinerary["current_version_id"]
+        if not base:
+            raise ValidationError("itinerary has no current version")
+        if data.get("idempotency_key"):
+            old = self.db.connection.execute("SELECT * FROM replan_proposals WHERE idempotency_key=?", (data["idempotency_key"],)).fetchone()
+            if old:
+                return json.loads(old["proposal_json"]) | {"proposal_id": old["id"], "status": old["status"]}
+        current = self.get_itinerary(itinerary_id)
+        options = self.replanner.build(current["activities"], data)
+        proposal_id = new_id()
+        proposal = {"proposal_id": proposal_id, "base_version_id": base, "event": data, "options": [{"option_id": f"option-{i}", **option} for i, option in enumerate(options, 1)]}
+        self.db.connection.execute("INSERT INTO replan_proposals(id,itinerary_id,base_version_id,event_type,event_json,proposal_json,status,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (proposal_id, itinerary_id, base, data["event_type"], json.dumps(data, ensure_ascii=False), json.dumps(proposal, ensure_ascii=False), "pending", data.get("idempotency_key"), self._now()))
+        self.db.connection.commit()
+        run = self.coordinator.run(itinerary_id=itinerary_id, message=f"重规划事件：{data['event_type']}", city="", plan={"conflicts": []})
+        proposal["agent_run"] = run
+        return proposal | {"status": "pending"}
 
-    def _new_version(self, itinerary_id: str, reason: str, trip_id: str, origin_id: str | None = None) -> dict[str, Any]:
+    def confirm_replan(self, itinerary_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        proposal = self.db.connection.execute("SELECT * FROM replan_proposals WHERE id=? AND itinerary_id=?", (data["proposal_id"], itinerary_id)).fetchone()
+        if not proposal:
+            raise KeyError("replan proposal not found")
+        if proposal["status"] == "confirmed":
+            return self.get_itinerary(itinerary_id) | {"status": "already_confirmed", "version_id": proposal["confirmed_version_id"]}
+        itinerary = self._itinerary(itinerary_id)
+        if itinerary["current_version_id"] != data["base_version_id"] or proposal["base_version_id"] != data["base_version_id"]:
+            raise ValidationError("stale itinerary version; refresh before confirming")
+        payload = json.loads(proposal["proposal_json"])
+        option = next((x for x in payload["options"] if x["option_id"] == data["option_id"]), None)
+        if not option:
+            raise ValidationError("replan option not found")
+        with self.db.connection:
+            self.db.connection.execute("DELETE FROM travel_legs WHERE itinerary_id=?", (itinerary_id,))
+            self.db.connection.execute("DELETE FROM activities WHERE itinerary_id=?", (itinerary_id,))
+            for activity in option["activities"]:
+                self.db.connection.execute("INSERT INTO activities(id,itinerary_id,poi_id,sequence,title,starts_at,ends_at,status,reservation_required,reservation_ref,note) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (activity["id"], itinerary_id, activity["poi_id"], activity["sequence"], activity.get("title", ""), activity["starts_at"], activity["ends_at"], activity.get("status", "planned"), int(activity.get("reservation_required", 0)), activity.get("reservation_ref"), activity.get("note")))
+            version = self._new_version(itinerary_id, data.get("change_reason", option["reason"]), itinerary["trip_id"], commit=False)
+            self.db.connection.execute("UPDATE replan_proposals SET status='confirmed', confirmed_version_id=? WHERE id=?", (version["new_version_id"], data["proposal_id"]))
+        return version | {"status": "confirmed", "proposal_id": data["proposal_id"]}
+
+    def diff_versions(self, itinerary_id: str, left_id: str, right_id: str) -> dict[str, Any]:
+        rows = self.db.connection.execute("SELECT id,snapshot_json FROM itinerary_versions WHERE itinerary_id=? AND id IN (?,?)", (itinerary_id, left_id, right_id)).fetchall()
+        snapshots = {row["id"]: json.loads(row["snapshot_json"]) for row in rows}
+        if len(snapshots) != 2:
+            raise KeyError("version not found")
+        left = {a["id"]: a for a in snapshots[left_id]["activities"]}
+        right = {a["id"]: a for a in snapshots[right_id]["activities"]}
+        return {"left_version_id": left_id, "right_version_id": right_id, "added": [right[k] for k in right.keys()-left.keys()], "removed": [left[k] for k in left.keys()-right.keys()], "changed": [{"before": left[k], "after": right[k]} for k in left.keys() & right.keys() if left[k] != right[k]]}
+
+    def list_agent_runs(self, itinerary_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.db.connection.execute("SELECT id,correlation_id,agent_name,status,model,policy_version,error,started_at,finished_at FROM agent_runs WHERE itinerary_id=? ORDER BY started_at", (itinerary_id,))]
+
+    def record_feedback(self, user_id: str, itinerary_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        feedback_id = new_id()
+        self.db.connection.execute("INSERT INTO feedback_events(id,user_id,itinerary_id,proposal_id,target_type,target_id,label,reason_code,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (feedback_id, user_id, itinerary_id, data.get("proposal_id"), data["target_type"], data["target_id"], data["label"], data.get("reason_code"), json.dumps(data.get("metadata", {}), ensure_ascii=False), self._now()))
+        self.db.connection.commit()
+        return {"id": feedback_id, "status": "recorded", **data}
+
+    def get_itinerary(self, itinerary_id: str) -> dict[str, Any]:
+        row = self._itinerary(itinerary_id); legs = []
+        for leg in self.db.connection.execute("SELECT * FROM travel_legs WHERE itinerary_id=? ORDER BY rowid", (itinerary_id,)):
+            item = dict(leg)
+            item["route_data"] = json.loads(item.pop("route_data_json", "{}"))
+            legs.append(item)
+        return {"id": itinerary_id, "trip_id": row["trip_id"], "status": row["status"], "current_version_id": row["current_version_id"], "activities": [dict(x) for x in self.db.connection.execute("SELECT * FROM activities WHERE itinerary_id=? ORDER BY sequence", (itinerary_id,))], "travel_legs": legs}
+
+    def _new_version(self, itinerary_id: str, reason: str, trip_id: str, origin_id: str | None = None, commit: bool = True) -> dict[str, Any]:
         snapshot = self._snapshot(itinerary_id, trip_id); version = new_id(); count = self.db.connection.execute("SELECT COALESCE(MAX(version_number),0)+1 FROM itinerary_versions WHERE itinerary_id=?", (itinerary_id,)).fetchone()[0]
-        self.db.connection.execute("INSERT INTO itinerary_versions(id,itinerary_id,version_number,change_reason,snapshot_json,restored_from_version_id,created_at) VALUES(?,?,?,?,?,?,?)", (version,itinerary_id,count,reason,json.dumps(snapshot,ensure_ascii=False),origin_id,self._now())); self.db.connection.execute("UPDATE itineraries SET current_version_id=? WHERE id=?", (version,itinerary_id)); self.db.connection.commit(); return self.get_itinerary(itinerary_id) | {"new_version_id": version, "version_number": count}
+        self.db.connection.execute("INSERT INTO itinerary_versions(id,itinerary_id,version_number,change_reason,snapshot_json,restored_from_version_id,created_at) VALUES(?,?,?,?,?,?,?)", (version,itinerary_id,count,reason,json.dumps(snapshot,ensure_ascii=False),origin_id,self._now())); self.db.connection.execute("UPDATE itineraries SET current_version_id=? WHERE id=?", (version,itinerary_id))
+        if commit:
+            self.db.connection.commit()
+        return self.get_itinerary(itinerary_id) | {"new_version_id": version, "version_number": count}
 
     def _snapshot(self, itinerary_id: str, trip_id: str) -> dict[str, Any]: return {"itinerary": {"id": itinerary_id, "trip_id": trip_id}, "activities": [dict(x) for x in self.db.connection.execute("SELECT * FROM activities WHERE itinerary_id=? ORDER BY sequence", (itinerary_id,))], "travel_legs": [dict(x) for x in self.db.connection.execute("SELECT * FROM travel_legs WHERE itinerary_id=?", (itinerary_id,))]}
     def _validate_db_schedule(self, itinerary_id: str) -> None:

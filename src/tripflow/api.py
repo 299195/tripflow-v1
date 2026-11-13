@@ -6,12 +6,15 @@ layer remains usable without Pydantic/FastAPI installed (for offline tests).
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from .service import TripFlowService
 from .domain.errors import ValidationError
+from .v2_schemas import ExecutionEventRequest, FeedbackRequest, ReplanConfirmRequest, ReplanPreviewRequest
+from .route_service import RouteProviderUnavailable
 
 
 def create_app(service: TripFlowService | None = None):
@@ -37,6 +40,8 @@ def create_app(service: TripFlowService | None = None):
             raise HTTPException(404, str(exc)) from exc
         except ValidationError as exc:
             raise HTTPException(422, {"status": "invalid_input", "detail": str(exc)}) from exc
+        except RouteProviderUnavailable as exc:
+            raise HTTPException(502, {"status": "route_unavailable", "detail": str(exc)}) from exc
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -155,7 +160,8 @@ def create_app(service: TripFlowService | None = None):
                     candidates.append({"query": query, "place": None, "verified": False})
         except (ValueError, RuntimeError):
             candidates = [{"query": q, "place": None, "verified": False} for q in guide["place_queries"]]
-        return {"status": "draft", "city": city, "guide": guide, "candidates": candidates, "saved": False, "mode": mode}
+        agent_trace = runtime.coordinator.run(itinerary_id=None, message=message, city=city, candidates=candidates)
+        return {"status": "draft", "city": city, "guide": guide, "candidates": candidates, "saved": False, "mode": mode, "agent_trace": agent_trace}
 
     @app.post("/api/v1/trips/{trip_id}/itinerary/generate")
     def generate(trip_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -180,6 +186,39 @@ def create_app(service: TripFlowService | None = None):
     @app.post("/api/v1/itineraries/{itinerary_id}/execution-events", status_code=201)
     def execution_event(itinerary_id: str, body: dict[str, Any]) -> dict[str, Any]:
         return call(runtime.execution_event, itinerary_id, body)
+
+    @app.post("/api/v2/itineraries/{itinerary_id}/replan/preview")
+    def replan_preview(itinerary_id: str, body: ReplanPreviewRequest) -> dict[str, Any]:
+        return call(runtime.preview_replan, itinerary_id, body.model_dump())
+
+    @app.post("/api/v2/itineraries/{itinerary_id}/replan/confirm")
+    def replan_confirm(itinerary_id: str, body: ReplanConfirmRequest) -> dict[str, Any]:
+        return call(runtime.confirm_replan, itinerary_id, body.model_dump())
+
+    @app.get("/api/v2/itineraries/{itinerary_id}/versions/diff")
+    def version_diff(itinerary_id: str, left_version_id: str, right_version_id: str) -> dict[str, Any]:
+        return call(runtime.diff_versions, itinerary_id, left_version_id, right_version_id)
+
+    @app.get("/api/v2/itineraries/{itinerary_id}/agent-runs")
+    def agent_runs(itinerary_id: str) -> dict[str, Any]:
+        return {"data": call(runtime.list_agent_runs, itinerary_id)}
+
+    @app.post("/api/v2/itineraries/{itinerary_id}/feedback", status_code=201)
+    def feedback(itinerary_id: str, body: FeedbackRequest, user_id: str = "local-traveler") -> dict[str, Any]:
+        return call(runtime.record_feedback, user_id, itinerary_id, body.model_dump())
+
+    @app.post("/api/v2/itineraries/{itinerary_id}/execution-events", status_code=201)
+    def v2_execution_event(itinerary_id: str, body: ExecutionEventRequest) -> dict[str, Any]:
+        data = body.model_dump()
+        stored = dict(data)
+        if stored["event_type"] in {"delayed", "closed"}:
+            stored["note"] = json.dumps({"event_type": stored["event_type"], "delay_minutes": stored.get("delay_minutes", 0), "note": stored.get("note")}, ensure_ascii=False)
+            stored["event_type"] = "note"
+        event = call(runtime.execution_event, itinerary_id, stored)
+        event["event_type"] = data["event_type"]
+        if data["event_type"] in {"delayed", "closed", "skipped"}:
+            event["replan_preview"] = call(runtime.preview_replan, itinerary_id, data)
+        return event
 
     # Zero-build mobile web client. API routes are declared before the mount,
     # so the static fallback cannot shadow the backend endpoints.

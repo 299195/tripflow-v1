@@ -1,6 +1,6 @@
 # TripFlow V1
 
-TripFlow V1 是单用户、单城市、单次旅行优先的中文旅行规划网页端。当前交付包含对话式攻略草稿、地点搜索与收藏、确定性行程规划、版本管理和基础执行事件；多人协作、多 Agent 自进化、自动预订、未授权爬虫和实时动态重规划不在 V1 范围内。
+TripFlow V2 是单用户、单城市、单次旅行优先的中文旅行规划网页端。当前交付包含对话式攻略草稿、地点搜索与收藏、真实路线适配、候选重规划、多 Agent 运行记录、反馈评测和策略门槛；多人协作、自动预订和生产级多租户认证仍不在范围内。
 
 ## 快速启动
 
@@ -45,6 +45,20 @@ python eval/run_eval.py --adapter tripflow_adapter:TripFlowAdapter
 ```
 
 安装 `[dev]` 后运行 `python -m pytest -q`，并用 `node --check frontend/product.js` 检查页面脚本。手工验收顺序：打开 `/`，输入城市、日期和旅行想法；选择候选地点并保存；到探索页搜索或定位周边地点并收藏；最后到“我的旅行”查看收藏、行程和历史版本。地图和模型 API 失败时页面展示可理解的错误提示。默认自动化测试使用 Fixture，不代表真实高德或 Qwen 请求成功。
+
+V2 业务链路评测使用真实 Service 和规划器，不使用合成业务适配器：
+
+```powershell
+python eval/run_v2_business_eval.py
+python eval/run_evolution_eval_v2.py --candidate improved --decision approve
+python eval/run_evolution_eval_v2.py --candidate regression --decision reject
+```
+
+V2 文档：
+
+- [V2 需求与功能说明](docs/TripFlow_V2_需求与功能说明.md)
+- [V2 技术实现说明](docs/TripFlow_V2_技术实现说明.md)
+- [V1 到 V2 变化与限制](docs/TripFlow_V1_to_V2_变化与限制.md)
 
 Qwen 真实验证需要在当前进程中明确启用 `QWEN_ENABLED=1`，然后执行一次安全的最小 smoke request；默认测试使用 mock，不把 mock 结果记录为真实调用。评测报告中的 `qwen.configured`、`qwen.mode` 和 `qwen_live_validation` 会区分配置状态、回退/结构化模式和是否真实请求。
 

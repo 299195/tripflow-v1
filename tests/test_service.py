@@ -1,11 +1,12 @@
 import unittest
 
 from tripflow.service import TripFlowService
+from tripflow.qwen_agent import QwenAgent, QwenSettings
 
 
 class ServiceFlowTests(unittest.TestCase):
     def setUp(self):
-        self.service = TripFlowService()
+        self.service = TripFlowService(agent=QwenAgent(QwenSettings("offline", enabled=False)))
         self.user = "user-1"
         self.service.create_trip({"user_id": self.user, "city": "杭州", "start_date": "2026-12-01", "end_date": "2026-12-02"})
         self.trip = self.service.db.connection.execute("SELECT * FROM trips").fetchone()

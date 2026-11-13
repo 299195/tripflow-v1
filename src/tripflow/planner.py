@@ -1,4 +1,4 @@
-"""Deterministic V1 planner.
+"""Deterministic planner with provider-backed route metadata.
 
 The planner never invents provider data.  POIs and route results are inputs;
 when no route provider is configured it emits an explicitly labelled straight
@@ -6,8 +6,8 @@ line estimate, which is suitable for reproducible offline planning only.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta, timezone
 from math import asin, cos, radians, sin, sqrt
 from typing import Any, Callable
 
@@ -45,6 +45,16 @@ class PlannedLeg:
     duration_minutes: int
     distance_meters: int
     source: str
+    mode: str = "walking"
+    raw_summary: dict[str, Any] = field(default_factory=dict)
+    fetched_at: str | None = None
+    estimated: bool = False
+
+    def __post_init__(self) -> None:
+        # Keep the dataclass backwards-compatible with the original five-field
+        # constructor while ensuring each leg owns its metadata dictionary.
+        if self.raw_summary is None:
+            object.__setattr__(self, "raw_summary", {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +66,33 @@ class PlanResult:
     explanation: str
 
 
-RouteProvider = Callable[[dict[str, Any], dict[str, Any]], tuple[int, int, str] | None]
+@dataclass(frozen=True, slots=True)
+class RouteResult:
+    """A normalized route result consumed by the deterministic planner.
+
+    ``source`` is deliberately separate from the numbers.  A fallback estimate
+    therefore cannot be mistaken for a provider route by callers or the UI.
+    ``raw_summary`` is a bounded, secret-free summary rather than the complete
+    upstream response.
+    """
+
+    duration_minutes: int
+    distance_meters: int
+    source: str
+    mode: str = "walking"
+    raw_summary: dict[str, Any] = field(default_factory=dict)
+    fetched_at: str | None = None
+    estimated: bool = False
+
+    def __post_init__(self) -> None:
+        if self.duration_minutes < 0 or self.distance_meters < 0:
+            raise ValueError("route duration and distance must be non-negative")
+
+
+RouteProvider = Callable[
+    [dict[str, Any], dict[str, Any]], RouteResult | tuple[int, int, str] | None
+]
+RouteProviderResult = RouteResult
 
 
 class DeterministicPlanner:
@@ -122,13 +158,44 @@ class DeterministicPlanner:
                     raise ValidationError("route unavailable")
                 route = route_provider(poi, next_poi) if route_provider else None
                 if route is None:
-                    duration_m, distance_m, source = self._estimate(poi, next_poi)
+                    route_result = self.estimate_route(
+                        poi,
+                        next_poi,
+                        reason="route_provider_not_configured",
+                    )
+                    duration_m = route_result.duration_minutes
+                    distance_m = route_result.distance_meters
+                    source = route_result.source
+                elif isinstance(route, RouteResult):
+                    route_result = route
+                    duration_m = route_result.duration_minutes
+                    distance_m = route_result.distance_meters
+                    source = route_result.source
                 else:
+                    # V1 providers returned a three-tuple.  Accept it so the
+                    # planner remains compatible with existing callers while
+                    # V2 providers can return complete route metadata.
                     duration_m, distance_m, source = route
+                    route_result = RouteResult(
+                        duration_m,
+                        distance_m,
+                        source,
+                        estimated="estimate" in str(source).lower(),
+                    )
                 cursor += timedelta(minutes=duration_m)
                 if cursor > window_end_dt:
                     raise ValidationError("travel time leaves no feasible itinerary")
-                legs.append(PlannedLeg(poi_id, request.poi_ids[index], duration_m, distance_m, source))
+                legs.append(PlannedLeg(
+                    poi_id,
+                    request.poi_ids[index],
+                    duration_m,
+                    distance_m,
+                    source,
+                    route_result.mode,
+                    route_result.raw_summary,
+                    route_result.fetched_at,
+                    route_result.estimated,
+                ))
         return PlanResult("feasible", None, activities, legs, "deterministic schedule validated")
 
     @staticmethod
@@ -151,3 +218,26 @@ class DeterministicPlanner:
         y = radians(lat2 - lat1)
         distance = int(earth * sqrt(x * x + y * y))
         return max(5, int(round(distance / 250))), distance, "deterministic_straight_line_estimate"
+
+    @classmethod
+    def estimate_route(
+        cls,
+        a: dict[str, Any],
+        b: dict[str, Any],
+        *,
+        reason: str,
+        fetched_at: str | None = None,
+    ) -> RouteResult:
+        duration, distance, source = cls._estimate(a, b)
+        return RouteResult(
+            duration_minutes=duration,
+            distance_meters=distance,
+            source=source,
+            raw_summary={
+                "kind": "estimate",
+                "method": "straight_line_distance",
+                "reason": reason,
+            },
+            fetched_at=fetched_at or datetime.now(timezone.utc).isoformat(),
+            estimated=True,
+        )
