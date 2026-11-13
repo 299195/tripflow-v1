@@ -1,0 +1,20 @@
+{
+  "data_version": "synthetic-v1",
+  "api_mode": "fixture",
+  "city": "杭州市",
+  "cases": [
+    {"id":"normal_multi_stop","kind":"plan","request":{"city":"杭州市","poi_ids":["west-lake","museum","tea-garden"],"date":"2026-12-01","start":"09:00","end":"18:00"},"expect":{"status":"feasible","max_stops":8}},
+    {"id":"fixed_booking_conflict","kind":"plan","request":{"poi_ids":["west-lake","museum"],"fixed_booking":{"poi_id":"museum","start":"10:00","end":"10:30"},"date":"2026-12-01"},"expect":{"status":"conflict","reason_code":"FIXED_BOOKING_CONFLICT"}},
+    {"id":"route_failure","kind":"plan","request":{"poi_ids":["west-lake","closed-island"],"route_overrides":{"west-lake->closed-island":"ROUTE_UNAVAILABLE"}},"expect":{"status":"route_error","reason_code":"ROUTE_UNAVAILABLE"}},
+    {"id":"missing_poi_field","kind":"poi_search","request":{"query":"博物馆","poi_record":{"id":"museum","name":"杭州博物馆"}},"expect":{"status":"invalid_input","reason_code":"MISSING_LOCATION"}},
+    {"id":"ambiguous_place","kind":"poi_search","request":{"query":"人民公园","candidates":[{"id":"people-park-a","city":"杭州市"},{"id":"people-park-b","city":"宁波市"}]},"expect":{"status":"needs_clarification","reason_code":"AMBIGUOUS_POI"}},
+    {"id":"stay_too_long","kind":"plan","request":{"poi_ids":["west-lake"],"stay_minutes":{"west-lake":900},"window_minutes":480},"expect":{"status":"infeasible","reason_code":"STAY_EXCEEDS_WINDOW"}},
+    {"id":"delete_stop","kind":"edit","request":{"operation":"delete","poi_id":"museum","plan_id":"plan-1"},"expect":{"status":"updated","revision_increment":1}},
+    {"id":"replace_stop","kind":"edit","request":{"operation":"replace","from_poi_id":"museum","to_poi_id":"art-museum","plan_id":"plan-1"},"expect":{"status":"updated","revision_increment":1}},
+    {"id":"extend_activity","kind":"edit","request":{"operation":"extend","poi_id":"west-lake","additional_minutes":30,"plan_id":"plan-1"},"expect":{"status":"updated","revalidate":true}},
+    {"id":"restore_history","kind":"history","request":{"plan_id":"plan-1","target_revision":1},"expect":{"status":"restored","new_revision":3}},
+    {"id":"duplicate_request","kind":"idempotency","request":{"idempotency_key":"idem-001","payload":{"poi_ids":["west-lake"]}},"expect":{"status":"same_result","max_mutations":1}},
+    {"id":"request_timeout","kind":"timeout","request":{"timeout_ms":100,"simulated_latency_ms":250},"expect":{"status":"timeout","reason_code":"UPSTREAM_TIMEOUT"}},
+    {"id":"no_feasible_itinerary","kind":"plan","request":{"poi_ids":["museum","tea-garden"],"fixed_booking":{"poi_id":"museum","start":"16:00","end":"17:00"},"date":"2026-12-01","start":"09:00","end":"16:30","route_overrides":{"museum->tea-garden":"ROUTE_UNAVAILABLE"}},"expect":{"status":"infeasible","reason_code":"NO_FEASIBLE_ITINERARY"}}
+  ]
+}
